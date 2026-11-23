@@ -1,0 +1,57 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env: { POSTGRES_USER: app, POSTGRES_PASSWORD: app, POSTGRES_DB: hotels_test }
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U app" --health-interval 3s --health-retries 20
+      rabbitmq:
+        image: rabbitmq:4
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval 5s --health-timeout 10s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - run: uv run pytest
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start everything
+        run: |
+          cp .env.example .env
+          echo "JWT_SECRET=$(openssl rand -hex 32)" >> .env
+          # Scheduler is left out: CI must not load public APIs on every push.
+          docker compose up -d --build --wait --wait-timeout 180 api worker demo-supplier
+      - name: Parse the demo supplier end to end
+        run: |
+          export ADMIN_PASSWORD=ci-password
+          docker compose exec -T -e ADMIN_PASSWORD api python -m aggregator.cli create-admin ci@example.com
+          token=$(curl -sf -d "username=ci@example.com&password=$ADMIN_PASSWORD" localhost:8000/auth/token | jq -r .access_token)
+          curl -sf localhost:8000/jobs -H "Authorization: Bearer $token" \
+            -H "Content-Type: application/json" -d '{"city":"chisinau","source":"demo"}'
+          for _ in $(seq 60); do
+            found=$(curl -sf "localhost:8000/hotels?source=demo" | jq '.items | length')
+            [ "$found" -gt 0 ] && exit 0
+            sleep 2
+          done
+          exit 1
+      - if: failure()
+        run: docker compose logs

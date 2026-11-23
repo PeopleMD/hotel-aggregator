@@ -1,0 +1,83 @@
+x-app: &app
+  build: .
+  image: hotel-aggregator
+  environment: &env
+    DATABASE_URL: postgresql+asyncpg://app:${POSTGRES_PASSWORD:?copy .env.example to .env}@postgres:5432/hotels
+    RABBIT_URL: amqp://app:${RABBIT_PASSWORD:?copy .env.example to .env}@rabbitmq:5672/
+    JWT_SECRET: ${JWT_SECRET:?copy .env.example to .env}
+    DEMO_SUPPLIER_URL: http://demo-supplier:8001
+    CONTACT_URL: ${CONTACT_URL:-}
+  restart: unless-stopped
+  depends_on: &deps
+    migrate:
+      condition: service_completed_successfully
+    rabbitmq:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?copy .env.example to .env}
+      POSTGRES_DB: hotels
+    volumes: [pgdata:/var/lib/postgresql/data]
+    ports: ["127.0.0.1:5432:5432"]
+    healthcheck:
+      test: pg_isready -U app -d hotels
+      interval: 3s
+      retries: 20
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    # The node name depends on the hostname; without it data is lost on re-create.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: ${RABBIT_PASSWORD:?copy .env.example to .env}
+    volumes: [mqdata:/var/lib/rabbitmq]
+    ports: ["127.0.0.1:5672:5672", "127.0.0.1:15672:15672"]
+    healthcheck:
+      test: rabbitmq-diagnostics -q check_port_connectivity
+      interval: 5s
+      timeout: 10s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: alembic upgrade head
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports: ["127.0.0.1:8000:8000"]
+    healthcheck:
+      test: python -c "import urllib.request as r; r.urlopen('http://localhost:8000/health')"
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+
+  worker:
+    <<: *app
+    command: python -m aggregator.worker
+    deploy:
+      replicas: 2
+
+  scheduler:
+    <<: *app
+    command: python -m aggregator.scheduler
+
+  demo-supplier:
+    <<: *app
+    command: uvicorn app:app --app-dir demo_supplier --host 0.0.0.0 --port 8001
+    environment: {}
+    depends_on: []
+
+volumes:
+  pgdata:
+  mqdata:
